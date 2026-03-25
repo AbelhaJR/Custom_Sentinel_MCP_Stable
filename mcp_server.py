@@ -52,21 +52,34 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TABLE_CATALOG_PATH = os.path.join(BASE_DIR, "workspace_tables.json")
 
 WORKSPACE_TABLE_CATALOG: Dict[str, List[str]] = {}
+_CATALOG_LOADED = False
+_CATALOG_LOCK = threading.Lock()
 
-try:
-    with open(TABLE_CATALOG_PATH, "r", encoding="utf-8") as f:
-        raw_catalog = json.load(f)
-        if isinstance(raw_catalog, dict):
-            WORKSPACE_TABLE_CATALOG = {
-                str(k): [str(v) for v in vals if isinstance(v, str)]
-                for k, vals in raw_catalog.items()
-                if isinstance(vals, list)
-            }
-        else:
-            logger.warning("Workspace catalog is not a JSON object")
-except Exception as e:
-    logger.error("Failed to load workspace catalog: %s", e)
-    WORKSPACE_TABLE_CATALOG = {}
+def _ensure_catalog_loaded() -> None:
+    """Lazy-load the workspace table catalog on first use.
+    Safe to call multiple times — loads only once (double-checked locking).
+    """
+    global WORKSPACE_TABLE_CATALOG, _CATALOG_LOADED
+    if _CATALOG_LOADED:
+        return
+    with _CATALOG_LOCK:
+        if _CATALOG_LOADED:          # re-check inside lock
+            return
+        try:
+            with open(TABLE_CATALOG_PATH, "r", encoding="utf-8") as f:
+                raw_catalog = json.load(f)
+                if isinstance(raw_catalog, dict):
+                    WORKSPACE_TABLE_CATALOG = {
+                        str(k): [str(v) for v in vals if isinstance(v, str)]
+                        for k, vals in raw_catalog.items()
+                        if isinstance(vals, list)
+                    }
+                else:
+                    logger.warning("Workspace catalog is not a JSON object")
+        except Exception as e:
+            logger.error("Failed to load workspace catalog: %s", e)
+            WORKSPACE_TABLE_CATALOG = {}
+        _CATALOG_LOADED = True
 
 # ============================================================
 # CONFIGURATION
@@ -308,6 +321,7 @@ def _la_first_table_dicts(payload: dict) -> List[dict]:
     return [dict(zip(columns, r)) for r in rows]
 
 def _flatten_catalog_tables() -> List[str]:
+    _ensure_catalog_loaded()
     seen = set()
     out = []
     for tables in WORKSPACE_TABLE_CATALOG.values():
@@ -364,9 +378,11 @@ def _catalog_domains_for_entity(entity_type: str) -> List[str]:
         ],
     }
     preferred = mapping.get(entity_type, ["alerts_and_incidents", "identity_and_authentication"])
+    _ensure_catalog_loaded()
     return [d for d in preferred if d in WORKSPACE_TABLE_CATALOG]
 
 def _catalog_tables_for_domains(domains: List[str]) -> List[str]:
+    _ensure_catalog_loaded()
     seen = set()
     out = []
     for domain in domains:
@@ -805,7 +821,7 @@ def ping() -> dict:
     return _ok({
         "message": "pong",
         "workspace_configured": bool(WORKSPACE_ID),
-        "catalog_loaded": bool(WORKSPACE_TABLE_CATALOG),
+        "catalog_loaded": bool((_ensure_catalog_loaded(), WORKSPACE_TABLE_CATALOG)[1]),
         "mcp_path": "/mcp",
     })
 
@@ -842,6 +858,7 @@ _register_tool_def(
 
 @mcp.tool
 def get_workspace_table_catalog() -> dict:
+    _ensure_catalog_loaded()
     if not WORKSPACE_TABLE_CATALOG:
         return _fail("Workspace table catalog not loaded", code="CATALOG_NOT_LOADED")
     return _ok({"catalog": WORKSPACE_TABLE_CATALOG})
@@ -855,6 +872,7 @@ _register_tool_def(
 
 @mcp.tool
 def debug_catalog_loaded() -> dict:
+    _ensure_catalog_loaded()
     return _ok({
         "loaded": bool(WORKSPACE_TABLE_CATALOG),
         "keys": list(WORKSPACE_TABLE_CATALOG.keys()),
@@ -873,6 +891,7 @@ _register_tool_def(
 
 @mcp.tool
 def list_workspace_tables() -> dict:
+    _ensure_catalog_loaded()
     if not WORKSPACE_TABLE_CATALOG:
         return _fail("Workspace table catalog not loaded", code="CATALOG_NOT_LOADED")
     return _ok({"tables": _flatten_catalog_tables()})
@@ -1298,6 +1317,7 @@ def analyze_entity(value: str, timespan: str = DEFAULT_TIMESPAN, max_rows: int =
     # Build catalog-aware preferred set — but do NOT skip tables that are in
     # the hardcoded table_map just because they're absent from the catalog.
     # The catalog may be incomplete; we filter only when the catalog IS loaded.
+    _ensure_catalog_loaded()
     preferred_tables = set(_catalog_tables_for_domains(preferred_domains)) if WORKSPACE_TABLE_CATALOG else set()
 
     table_map = {
