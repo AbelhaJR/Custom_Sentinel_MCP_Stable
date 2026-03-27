@@ -1446,8 +1446,11 @@ _register_tool_def(
         "Lists recent Sentinel incidents or generates a structured SOC report for a single incident. "
         "Omit incident_id to get a list of recent incidents. "
         "Provide incident_id (incident number or name) to get a detailed report including linked alerts, "
-        "entities, tactics, and risk level. "
-        "Use investigate_incident for a deeper investigation with parallel entity lookups."
+        "fully parsed and typed entities (hosts, accounts, IPs, URLs, files, processes, registry keys, "
+        "cloud resources), tactics, techniques, and risk level. "
+        "Uses three focused queries (incident metadata, alerts, entities) to avoid join fan-out and "
+        "reliably extract all entity types. "
+        "Use investigate_incident for a deeper investigation with parallel entity lookups across telemetry tables."
     ),
     {
         "incident_id": "optional: Sentinel incident number or IncidentName",
@@ -1471,10 +1474,7 @@ def get_incident_report(
 
     # ── MODE 1: LIST INCIDENTS ─────────────────────────────────────────────
     if not incident_id:
-        if hours.is_integer():
-            ago_expr = f"{int(hours)}h"
-        else:
-            ago_expr = f"{hours}h"
+        ago_expr = f"{int(hours)}h" if hours.is_integer() else f"{hours}h"
 
         kql = f"""
 SecurityIncident
@@ -1482,7 +1482,9 @@ SecurityIncident
 | where CreatedTime >= ago({ago_expr})
 | summarize arg_max(LastModifiedTime, *) by IncidentNumber
 | project
-    IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime
+    IncidentNumber, Title, Severity, Status, Owner,
+    CreatedTime, LastModifiedTime, ClosedTime,
+    Classification, ClassificationReason, ClassificationComment
 | order by CreatedTime desc
 | take {top}
 """.strip()
@@ -1500,72 +1502,190 @@ SecurityIncident
     # ── MODE 2: INCIDENT REPORT ────────────────────────────────────────────
     safe_id = escape_kql_string(str(incident_id))
 
-    kql = f"""
+    # ── Query 1: Incident metadata ─────────────────────────────────────────
+    kql_incident = f"""
 SecurityIncident
 | where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
 | summarize arg_max(LastModifiedTime, *) by IncidentNumber
-| project IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime, AlertIds
-| mv-expand AlertIds
-| extend AlertIdStr = tostring(AlertIds)
-| join kind=leftouter (
-    SecurityAlert
-    | project
-        SystemAlertId,
-        AlertName = ProductName,
-        AlertComponent = ProductComponentName,
-        AlertStatus = Status,
-        AlertTime = StartTime,
-        CompromisedEntity,
-        Tactics,
-        Techniques,
-        Entities
-    | extend AlertIdStr = tostring(SystemAlertId)
-) on AlertIdStr
-| summarize
-    Alerts = countif(isnotempty(AlertIdStr)),
-    AlertNames = make_set(AlertName, 10),
-    AlertComponents = make_set(AlertComponent, 10),
-    AlertStatuses = make_set(AlertStatus, 10),
-    CompromisedEntities = make_set(CompromisedEntity, 10),
-    TacticsSet = make_set(Tactics, 10),
-    TechniquesSet = make_set(Techniques, 10),
-    FirstAlert = min(AlertTime),
-    LastAlert = max(AlertTime)
-    by
-    IncidentNumber, Title, Severity, Status, Owner, CreatedTime, LastModifiedTime
+| project
+    IncidentNumber, Title, Severity, Status, Owner,
+    CreatedTime, LastModifiedTime, ClosedTime,
+    Classification, ClassificationReason, ClassificationComment,
+    AlertIds, Labels, IncidentUrl
 """.strip()
 
-    res = la_query(kql, timespan)
-    if not res.get("ok"):
-        return res
+    res_inc = la_query(kql_incident, timespan)
+    if not res_inc.get("ok"):
+        return res_inc
 
-    incidents = _la_first_table_dicts(res["data"])
+    incidents = _la_first_table_dicts(res_inc["data"])
     if not incidents:
         return _fail("Incident not found", code="NOT_FOUND")
 
     incident = incidents[0]
-    severity = (incident.get("Severity") or "").lower()
-    risk = "High" if severity == "high" else ("Medium" if severity == "medium" else "Low")
+
+    # ── Query 2: Linked alerts (full fields, deduplicated) ─────────────────
+    kql_alerts = f"""
+SecurityIncident
+| where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber
+| mv-expand AlertId = AlertIds to typeof(string)
+| join kind=inner (
+    SecurityAlert
+    | summarize arg_max(TimeGenerated, *) by SystemAlertId
+    | project
+        SystemAlertId,
+        AlertName,
+        AlertSeverity,
+        AlertDescription = Description,
+        AlertStatus     = Status,
+        AlertStartTime  = StartTime,
+        AlertEndTime    = EndTime,
+        ProductName,
+        ProductComponentName,
+        CompromisedEntity,
+        Tactics,
+        Techniques,
+        SubTechniques,
+        AlertLink,
+        Entities
+) on $left.AlertId == $right.SystemAlertId
+| project
+    AlertId,
+    AlertName,
+    AlertSeverity,
+    AlertDescription,
+    AlertStatus,
+    AlertStartTime,
+    AlertEndTime,
+    ProductName,
+    ProductComponentName,
+    CompromisedEntity,
+    Tactics,
+    Techniques,
+    SubTechniques,
+    AlertLink,
+    Entities
+""".strip()
+
+    res_alerts = la_query(kql_alerts, timespan)
+    # Don't fail hard — incident may have no correlated alerts yet
+    alert_rows = _la_first_table_dicts(res_alerts["data"]) if res_alerts.get("ok") else []
+
+    # ── Query 3: Entities — parsed, expanded, and typed ────────────────────
+    # mv-expand + parse_json in KQL is the only reliable way to extract all
+    # entity types; reading the raw Entities blob misses most values.
+    kql_entities = f"""
+SecurityIncident
+| where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
+| summarize arg_max(LastModifiedTime, *) by IncidentNumber
+| mv-expand AlertId = AlertIds to typeof(string)
+| join kind=inner (
+    SecurityAlert
+    | summarize arg_max(TimeGenerated, *) by SystemAlertId
+    | project SystemAlertId, Entities
+) on $left.AlertId == $right.SystemAlertId
+| mv-expand Entity = parse_json(Entities)
+| where isnotempty(Entity)
+| extend EntityType = tostring(Entity.Type)
+| extend EntityName = coalesce(
+    tostring(Entity.HostName),
+    tostring(Entity.Name),
+    tostring(Entity.Address),
+    tostring(Entity.AccountName),
+    tostring(Entity.CommandLine),
+    tostring(Entity.Url),
+    tostring(Entity.DomainName)
+)
+| where isnotempty(EntityName) and EntityName != "null"
+| summarize
+    Hosts          = make_set_if(EntityName, EntityType =~ "host", 50),
+    Accounts       = make_set_if(EntityName, EntityType =~ "account", 50),
+    IpAddresses    = make_set_if(EntityName, EntityType =~ "ip", 50),
+    Urls           = make_set_if(EntityName, EntityType =~ "url", 50),
+    Files          = make_set_if(EntityName, EntityType =~ "file", 50),
+    Processes      = make_set_if(EntityName, EntityType =~ "process", 50),
+    RegistryKeys   = make_set_if(EntityName, EntityType =~ "registrykey", 50),
+    CloudResources = make_set_if(EntityName, EntityType =~ "cloudapplication" or EntityType =~ "azureresource", 50),
+    AllEntities    = make_set(EntityName, 200)
+by IncidentNumber
+""".strip()
+
+    res_ent = la_query(kql_entities, timespan)
+    entity_row: dict = {}
+    if res_ent.get("ok"):
+        ent_rows = _la_first_table_dicts(res_ent["data"])
+        if ent_rows:
+            entity_row = ent_rows[0]
+
+    # ── Assemble structured alert list ─────────────────────────────────────
+    alerts_structured = []
+    for a in alert_rows:
+        alerts_structured.append({
+            "alert_id":           a.get("AlertId"),
+            "alert_name":         a.get("AlertName"),
+            "severity":           a.get("AlertSeverity"),
+            "description":        a.get("AlertDescription"),
+            "status":             a.get("AlertStatus"),
+            "start_time":         a.get("AlertStartTime"),
+            "end_time":           a.get("AlertEndTime"),
+            "product":            a.get("ProductName"),
+            "component":          a.get("ProductComponentName"),
+            "compromised_entity": a.get("CompromisedEntity"),
+            "tactics":            a.get("Tactics"),
+            "techniques":         a.get("Techniques"),
+            "sub_techniques":     a.get("SubTechniques"),
+            "alert_link":         a.get("AlertLink"),
+        })
+
+    # ── Risk scoring (severity + alert volume + entity spread) ─────────────
+    severity    = (incident.get("Severity") or "").lower()
+    alert_count = len(alerts_structured)
+    entity_count = len(entity_row.get("AllEntities") or [])
+
+    if severity == "high" or alert_count >= 5 or entity_count >= 10:
+        risk = "Critical"
+    elif severity == "medium" or alert_count >= 2 or entity_count >= 5:
+        risk = "High"
+    elif severity == "low":
+        risk = "Medium"
+    else:
+        risk = "Low"
 
     return _ok({
         "mode": "report",
-        "incident_number": incident.get("IncidentNumber"),
-        "title": incident.get("Title"),
-        "severity": incident.get("Severity"),
-        "status": incident.get("Status"),
-        "owner": incident.get("Owner"),
-        "created_time": incident.get("CreatedTime"),
-        "last_modified": incident.get("LastModifiedTime"),
-        "alerts_count": incident.get("Alerts"),
-        "alert_names": incident.get("AlertNames"),
-        "alert_components": incident.get("AlertComponents"),
-        "alert_statuses": incident.get("AlertStatuses"),
-        "compromised_entities": incident.get("CompromisedEntities"),
-        "tactics": incident.get("TacticsSet"),
-        "techniques": incident.get("TechniquesSet"),
-        "first_alert": incident.get("FirstAlert"),
-        "last_alert": incident.get("LastAlert"),
-        "risk_level": risk,
+        # ── Incident core ──────────────────────────────────────────────────
+        "incident_number":        incident.get("IncidentNumber"),
+        "title":                  incident.get("Title"),
+        "severity":               incident.get("Severity"),
+        "status":                 incident.get("Status"),
+        "owner":                  incident.get("Owner"),
+        "created_time":           incident.get("CreatedTime"),
+        "last_modified":          incident.get("LastModifiedTime"),
+        "closed_time":            incident.get("ClosedTime"),
+        "classification":         incident.get("Classification"),
+        "classification_reason":  incident.get("ClassificationReason"),
+        "classification_comment": incident.get("ClassificationComment"),
+        "incident_url":           incident.get("IncidentUrl"),
+        "labels":                 incident.get("Labels"),
+        # ── Alerts ────────────────────────────────────────────────────────
+        "alerts_count":           alert_count,
+        "alerts":                 alerts_structured,
+        # ── Entities — typed buckets ───────────────────────────────────────
+        "entities": {
+            "hosts":           entity_row.get("Hosts", []),
+            "accounts":        entity_row.get("Accounts", []),
+            "ip_addresses":    entity_row.get("IpAddresses", []),
+            "urls":            entity_row.get("Urls", []),
+            "files":           entity_row.get("Files", []),
+            "processes":       entity_row.get("Processes", []),
+            "registry_keys":   entity_row.get("RegistryKeys", []),
+            "cloud_resources": entity_row.get("CloudResources", []),
+            "all":             entity_row.get("AllEntities", []),
+        },
+        "entity_count":           entity_count,
+        # ── Risk ──────────────────────────────────────────────────────────
+        "risk_level":             risk,
     })
 
 # ─────────────────────────────────────────────────────────────
