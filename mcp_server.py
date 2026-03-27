@@ -1973,6 +1973,365 @@ SecurityAlert
 
 # ─────────────────────────────────────────────────────────────
 _register_tool_def(
+    "run_investigation_checklist",
+    (
+        "Executes the full mandatory investigation checklist for a Sentinel incident in a SINGLE call. "
+        "Runs all telemetry queries in parallel server-side and returns one consolidated evidence package. "
+        "Use this instead of calling investigate_incident + run_query + analyze_entity individually — "
+        "it avoids context window exhaustion from multiple sequential tool calls. "
+        "Supported checklists: execution, identity, lateral_movement, network, malware, cloud, behavioral, default. "
+        "Pass checklist='auto' to auto-detect from incident alert names. "
+        "Returns structured evidence buckets: incident_meta, similar_history, cmdb, process_events, "
+        "network_events, file_events, registry_events, device_events, security_alerts_30d, "
+        "behavior_analytics, signin_logs, entity_analysis, site_logs. "
+        "Each bucket contains: status (ok/partial/error/skipped), rows_returned, summary, raw_data."
+    ),
+    {
+        "incident_id":  "Sentinel incident number",
+        "checklist":    "auto | execution | identity | lateral_movement | network | malware | cloud | behavioral | default",
+        "timespan":     "ISO8601 duration, default P7D",
+    },
+)
+
+# ── Checklist definitions: each entry is (bucket_id, query_fn_or_label, params_dict)
+# query_fn values: "run_query", "analyze_entity", "cmdb", "investigate", "history"
+# These are resolved at runtime against actual extracted entities.
+
+def _checklist_execution(safe_host: str, safe_user: str, ts_short: str, ts_long: str) -> List[dict]:
+    return [
+        {"bucket": "cmdb",              "type": "cmdb",          "entity": safe_host},
+        {"bucket": "process_events",    "type": "run_query",     "timespan": ts_short,
+         "kql": f'DeviceProcessEvents | where DeviceName contains "{safe_host}" | project TimeGenerated, DeviceName, AccountName, InitiatingProcessCommandLine, ProcessCommandLine, FileName, SHA256 | order by TimeGenerated desc | take 100'},
+        {"bucket": "device_events",     "type": "run_query",     "timespan": ts_short,
+         "kql": f'DeviceEvents | where DeviceName contains "{safe_host}" | project TimeGenerated, DeviceName, ActionType, InitiatingProcessCommandLine, AdditionalFields | order by TimeGenerated desc | take 100'},
+        {"bucket": "network_events",    "type": "run_query",     "timespan": ts_long,
+         "kql": f'DeviceNetworkEvents | where DeviceName contains "{safe_host}" | project TimeGenerated, DeviceName, ActionType, RemoteIP, RemotePort, RemoteUrl, InitiatingProcessCommandLine | order by TimeGenerated desc | take 100'},
+        {"bucket": "registry_events",   "type": "run_query",     "timespan": ts_short,
+         "kql": f'DeviceRegistryEvents | where DeviceName contains "{safe_host}" | project TimeGenerated, DeviceName, ActionType, RegistryKey, RegistryValueData, InitiatingProcessCommandLine | order by TimeGenerated desc | take 100'},
+        {"bucket": "file_events",       "type": "run_query",     "timespan": ts_short,
+         "kql": f'DeviceFileEvents | where DeviceName contains "{safe_host}" | project TimeGenerated, DeviceName, ActionType, FileName, FolderPath, SHA256, InitiatingProcessCommandLine | order by TimeGenerated desc | take 100'},
+        {"bucket": "security_alerts_30d","type": "run_query",    "timespan": "P30D",
+         "kql": f'SecurityAlert | where CompromisedEntity contains "{safe_host}" or tostring(Entities) contains "{safe_host}" or tostring(Entities) contains "{safe_user}" | project TimeGenerated, AlertName, AlertSeverity, CompromisedEntity, Description, Tactics, Techniques | order by TimeGenerated desc | take 50'},
+        {"bucket": "behavior_analytics", "type": "run_query",    "timespan": "P30D",
+         "kql": f'BehaviorAnalytics | where UserName contains "{safe_user}" or DeviceName contains "{safe_host}" | project TimeGenerated, UserName, DeviceName, ActivityType, ActionType, InvestigationPriority | order by TimeGenerated desc | take 50'},
+        {"bucket": "signin_logs",        "type": "run_query",    "timespan": "P7D",
+         "kql": f'SigninLogs | where UserPrincipalName contains "{safe_user}" | project TimeGenerated, UserPrincipalName, IPAddress, Location, ResultType, AppDisplayName, DeviceDetail | order by TimeGenerated desc | take 50'},
+        {"bucket": "entity_host",        "type": "analyze_entity", "value": safe_host, "timespan": "P7D"},
+        {"bucket": "entity_user",        "type": "analyze_entity", "value": safe_user, "timespan": "P7D"},
+    ]
+
+def _checklist_identity(safe_user: str, safe_ip: str, ts_long: str) -> List[dict]:
+    return [
+        {"bucket": "signin_logs",        "type": "run_query",    "timespan": "P7D",
+         "kql": f'SigninLogs | where UserPrincipalName contains "{safe_user}" | project TimeGenerated, UserPrincipalName, IPAddress, Location, ResultType, AppDisplayName, ConditionalAccessStatus, DeviceDetail | order by TimeGenerated desc | take 100'},
+        {"bucket": "risk_events",        "type": "run_query",    "timespan": "P30D",
+         "kql": f'AADUserRiskEvents | where UserPrincipalName contains "{safe_user}" | project TimeGenerated, UserPrincipalName, RiskEventType, RiskLevel, IpAddress | order by TimeGenerated desc | take 50'},
+        {"bucket": "risky_users",        "type": "run_query",    "timespan": "P30D",
+         "kql": f'AADRiskyUsers | where UserPrincipalName contains "{safe_user}" | project TimeGenerated, UserPrincipalName, RiskLevel, RiskState, RiskDetail | order by TimeGenerated desc | take 20'},
+        {"bucket": "audit_logs",         "type": "run_query",    "timespan": "P2D",
+         "kql": f'AuditLogs | where tostring(InitiatedBy) contains "{safe_user}" | project TimeGenerated, OperationName, Result, InitiatedBy, TargetResources | order by TimeGenerated desc | take 50'},
+        {"bucket": "identity_info",      "type": "run_query",    "timespan": "P30D",
+         "kql": f'IdentityInfo | where AccountUPN contains "{safe_user}" | project TimeGenerated, AccountUPN, JobTitle, Department, Manager, AccountEnabled, Tags | take 5'},
+        {"bucket": "behavior_analytics", "type": "run_query",    "timespan": "P30D",
+         "kql": f'BehaviorAnalytics | where UserName contains "{safe_user}" | project TimeGenerated, UserName, ActivityType, ActionType, InvestigationPriority | order by TimeGenerated desc | take 50'},
+        {"bucket": "security_alerts_30d","type": "run_query",    "timespan": "P30D",
+         "kql": f'SecurityAlert | where tostring(Entities) contains "{safe_user}" | project TimeGenerated, AlertName, AlertSeverity, Description, Tactics, Techniques | order by TimeGenerated desc | take 50'},
+        {"bucket": "entity_user",        "type": "analyze_entity", "value": safe_user, "timespan": "P7D"},
+        {"bucket": "entity_ip",          "type": "analyze_entity", "value": safe_ip,   "timespan": "P7D"},
+        {"bucket": "signin_by_ip",       "type": "run_query",    "timespan": "P7D",
+         "kql": f'SigninLogs | where IPAddress == "{safe_ip}" | project TimeGenerated, UserPrincipalName, IPAddress, Location, ResultType, AppDisplayName | order by TimeGenerated desc | take 50'},
+    ]
+
+def _checklist_malware(safe_host: str, safe_user: str, safe_hash: str, ts_short: str) -> List[dict]:
+    hash_filter = f'| where SHA256 =~ "{safe_hash}" or SHA1 =~ "{safe_hash}" or MD5 =~ "{safe_hash}"' if safe_hash else ""
+    return [
+        {"bucket": "cmdb",               "type": "cmdb",         "entity": safe_host},
+        {"bucket": "file_events",        "type": "run_query",    "timespan": ts_short,
+         "kql": f'DeviceFileEvents | where DeviceName contains "{safe_host}" {hash_filter} | project TimeGenerated, DeviceName, ActionType, FileName, FolderPath, SHA256, InitiatingProcessCommandLine | order by TimeGenerated desc | take 100'},
+        {"bucket": "process_events",     "type": "run_query",    "timespan": ts_short,
+         "kql": f'DeviceProcessEvents | where DeviceName contains "{safe_host}" | project TimeGenerated, DeviceName, AccountName, FileName, ProcessCommandLine, InitiatingProcessCommandLine, SHA256 | order by TimeGenerated desc | take 100'},
+        {"bucket": "device_events",      "type": "run_query",    "timespan": ts_short,
+         "kql": f'DeviceEvents | where DeviceName contains "{safe_host}" | project TimeGenerated, DeviceName, ActionType, AdditionalFields | order by TimeGenerated desc | take 100'},
+        {"bucket": "network_events",     "type": "run_query",    "timespan": "P1D",
+         "kql": f'DeviceNetworkEvents | where DeviceName contains "{safe_host}" | project TimeGenerated, DeviceName, RemoteIP, RemotePort, RemoteUrl, InitiatingProcessCommandLine | order by TimeGenerated desc | take 100'},
+        {"bucket": "registry_events",    "type": "run_query",    "timespan": ts_short,
+         "kql": f'DeviceRegistryEvents | where DeviceName contains "{safe_host}" | project TimeGenerated, DeviceName, ActionType, RegistryKey, RegistryValueData | order by TimeGenerated desc | take 100'},
+        {"bucket": "threat_intel",       "type": "run_query",    "timespan": "P90D",
+         "kql": f'ThreatIntelIndicators | where IndicatorId contains "{safe_hash}" or NetworkIP contains "{safe_hash}" | take 20'},
+        {"bucket": "security_alerts_30d","type": "run_query",    "timespan": "P30D",
+         "kql": f'SecurityAlert | where CompromisedEntity contains "{safe_host}" or tostring(Entities) contains "{safe_host}" | project TimeGenerated, AlertName, AlertSeverity, Description, Tactics, Techniques | order by TimeGenerated desc | take 50'},
+        {"bucket": "entity_host",        "type": "analyze_entity", "value": safe_host, "timespan": "P7D"},
+    ]
+
+def _checklist_default(safe_host: str, safe_user: str) -> List[dict]:
+    return [
+        {"bucket": "cmdb",               "type": "cmdb",         "entity": safe_host},
+        {"bucket": "security_alerts_30d","type": "run_query",    "timespan": "P30D",
+         "kql": f'SecurityAlert | where CompromisedEntity contains "{safe_host}" or tostring(Entities) contains "{safe_host}" or tostring(Entities) contains "{safe_user}" | project TimeGenerated, AlertName, AlertSeverity, CompromisedEntity, Description, Tactics, Techniques | order by TimeGenerated desc | take 50'},
+        {"bucket": "behavior_analytics", "type": "run_query",    "timespan": "P30D",
+         "kql": f'BehaviorAnalytics | where UserName contains "{safe_user}" or DeviceName contains "{safe_host}" | project TimeGenerated, UserName, DeviceName, ActivityType, InvestigationPriority | order by TimeGenerated desc | take 50'},
+        {"bucket": "entity_host",        "type": "analyze_entity", "value": safe_host, "timespan": "P7D"},
+        {"bucket": "entity_user",        "type": "analyze_entity", "value": safe_user, "timespan": "P7D"},
+    ]
+
+def _auto_detect_checklist(alert_names: List[str], tactics: List[str]) -> str:
+    """Infer checklist type from alert names and MITRE tactics."""
+    combined = " ".join((alert_names or []) + (tactics or [])).lower()
+    if any(k in combined for k in ["powershell", "lolbin", "msbuild", "regsvr32", "rundll32", "mshta", "certutil",
+                                    "wmic", "msiexec", "execution", "defense evasion", "download"]):
+        return "execution"
+    if any(k in combined for k in ["signin", "login", "mfa", "brute", "password", "credential", "token",
+                                    "impossible travel", "risky user", "valid account"]):
+        return "identity"
+    if any(k in combined for k in ["smb", "psexec", "lateral", "dcom", "wmi remote", "pass-the-hash", "rdp"]):
+        return "lateral_movement"
+    if any(k in combined for k in ["beacon", "c2", "dns tunnel", "proxy", "outbound", "exfil", "network"]):
+        return "network"
+    if any(k in combined for k in ["malware", "ransomware", "virus", "trojan", "hash", "file", "dropper"]):
+        return "malware"
+    if any(k in combined for k in ["azure", "storage", "graph api", "service principal", "m365", "office"]):
+        return "cloud"
+    if any(k in combined for k in ["anomaly", "ueba", "behavioral", "peer analysis", "deviation"]):
+        return "behavioral"
+    return "default"
+
+def _run_checklist_tasks(tasks: List[dict], timespan: str) -> Dict[str, dict]:
+    """Fan out all non-entity tasks in parallel, run analyze_entity sequentially after."""
+    parallel_tasks = []
+    entity_tasks   = []
+    cmdb_tasks_raw = []
+
+    for t in tasks:
+        ttype = t.get("type")
+        if ttype == "run_query":
+            parallel_tasks.append((t["bucket"], t["bucket"], t["kql"]))
+        elif ttype == "analyze_entity":
+            entity_tasks.append(t)
+        elif ttype == "cmdb":
+            cmdb_tasks_raw.append(t)
+
+    results: Dict[str, dict] = {}
+
+    # ── Parallel KQL queries ───────────────────────────────────────────────
+    if parallel_tasks:
+        raw = _run_queries_parallel(parallel_tasks, timespan)
+        results.update(raw)
+
+    # ── CMDB queries (sequential, no timespan) ────────────────────────────
+    for ct in cmdb_tasks_raw:
+        entity = ct["entity"]
+        if not entity:
+            results[ct["bucket"]] = _fail("No host entity — CMDB skipped", code="SKIPPED")
+            continue
+        safe_e = escape_kql_string(entity)
+        # Strip to shortest unique segment (strip domain suffix)
+        core = safe_e.split(".")[0] if "." in safe_e else safe_e
+
+        cmdb_kql = f"""
+COVERAGE_CMDB
+| where FQDN contains "{core}"
+   or Key contains "{core}"
+   or logsource contains "{core}"
+   or Management_IP contains "{core}"
+   or ApplicationAndComponentInstance contains "{core}"
+| project Key, FQDN, BusinessEntity, Management_IP, logsource, PSNC,
+          ApplicationAndComponentInstance, Network_Interfaces,
+          Scanning_Information, Environment, Operating_System, Status
+| take 10
+""".strip()
+        res = la_query(cmdb_kql, "P90D")
+
+        # Fallback 1: full hostname
+        if res.get("ok") and not _la_first_table_dicts(res["data"]):
+            fb1 = f'COVERAGE_CMDB | where FQDN contains "{safe_e}" or Key contains "{safe_e}" or logsource contains "{safe_e}" | project Key, FQDN, BusinessEntity, Management_IP, logsource, PSNC, ApplicationAndComponentInstance | take 10'
+            res = la_query(fb1, "P90D")
+
+        results[ct["bucket"]] = res
+
+    # ── Entity analysis ────────────────────────────────────────────────────
+    for et in entity_tasks:
+        val = et.get("value", "")
+        if not val:
+            results[et["bucket"]] = _fail("Empty entity value — skipped", code="SKIPPED")
+            continue
+        results[et["bucket"]] = analyze_entity(val, timespan=et.get("timespan", "P7D"))
+
+    return results
+
+def _summarise_bucket(bucket_id: str, res: dict) -> dict:
+    """Compress a bucket result into a compact summary safe for LLM context."""
+    if not res:
+        return {"status": "error", "rows": 0, "summary": "null result"}
+
+    if not res.get("ok"):
+        code = (res.get("error") or {}).get("code", "")
+        if code == "SKIPPED":
+            return {"status": "skipped", "rows": 0, "summary": (res.get("error") or {}).get("message", "")}
+        return {"status": "error", "rows": 0, "summary": (res.get("error") or {}).get("message", "tool error")}
+
+    # analyze_entity result shape
+    data = res.get("data") or {}
+    if "entity_type" in data:
+        return {
+            "status":  "ok",
+            "rows":    data.get("total_events", 0),
+            "summary": f"entity_type={data.get('entity_type')} risk={data.get('risk_level')} "
+                       f"tables_hit={data.get('tables_hit')} events={data.get('total_events')}",
+            "detail":  data,
+        }
+
+    # run_query / la_query result shape
+    rows = _la_first_table_dicts(data)
+    count = len(rows)
+    status = "ok" if count > 0 else "ok_empty"
+
+    # Build a compact field-value summary (top 5 rows, key fields only)
+    compact = []
+    for r in rows[:5]:
+        compact.append({k: v for k, v in r.items() if v not in (None, "", [])})
+
+    return {
+        "status":   status,
+        "rows":     count,
+        "summary":  f"{count} rows returned",
+        "sample":   compact,
+    }
+
+
+@mcp.tool
+def run_investigation_checklist(
+    incident_id: str,
+    checklist: str = "auto",
+    timespan: str = "P7D",
+) -> dict:
+    if not incident_id:
+        return _fail("incident_id is required", code="VALIDATION_ERROR")
+
+    try:
+        hours = parse_timespan_to_hours(timespan)
+    except Exception as e:
+        return _fail("Invalid timespan", code="VALIDATION_ERROR", detail=str(e))
+
+    if hours <= 0 or hours > MAX_HOURS_INCIDENT:
+        return _fail(f"Timespan too large (max {MAX_HOURS_INCIDENT}h)", code="VALIDATION_ERROR")
+
+    # ── Step 1: Get incident + similar history in parallel ─────────────────
+    safe_id = escape_kql_string(str(incident_id))
+
+    inc_res     = investigate_incident(incident_id, timespan=timespan)
+    hist_res    = get_similar_incident_history(incident_id, days=30)
+
+    if not inc_res.get("ok"):
+        return inc_res
+
+    inc_data    = inc_res.get("data") or {}
+    ents        = inc_data.get("entities") or {}
+    alert_names = list((inc_data.get("alerts") or {}).get("names") or [])
+    tactics     = list((inc_data.get("mitre") or {}).get("tactics") or [])
+
+    # ── Extract primary entities ───────────────────────────────────────────
+    hosts   = ents.get("hosts") or []
+    users   = ents.get("users") or []
+    ips     = ents.get("ips")   or []
+    hashes  = []  # populated from file events if present
+
+    safe_host = escape_kql_string(hosts[0].lower().split(".")[0]) if hosts else ""
+    safe_user = escape_kql_string(users[0]) if users else ""
+    safe_ip   = escape_kql_string(ips[0])   if ips   else ""
+    safe_hash = ""
+
+    # ── Step 2: Detect / validate checklist ───────────────────────────────
+    cl = (checklist or "auto").strip().lower()
+    if cl == "auto":
+        cl = _auto_detect_checklist(alert_names, tactics)
+
+    ts_short = "PT12H"
+    ts_long  = "P1D"
+
+    # ── Step 3: Build task list for chosen checklist ───────────────────────
+    if cl == "execution":
+        tasks = _checklist_execution(safe_host, safe_user, ts_short, ts_long)
+    elif cl == "identity":
+        tasks = _checklist_identity(safe_user, safe_ip, ts_long)
+    elif cl == "malware":
+        tasks = _checklist_malware(safe_host, safe_user, safe_hash, ts_short)
+    else:
+        tasks = _checklist_default(safe_host, safe_user)
+
+    # ── Step 4: Execute all tasks ──────────────────────────────────────────
+    raw_results = _run_checklist_tasks(tasks, timespan)
+
+    # ── Step 5: Compress each bucket for LLM consumption ──────────────────
+    buckets: Dict[str, dict] = {}
+    for task in tasks:
+        bid = task["bucket"]
+        buckets[bid] = _summarise_bucket(bid, raw_results.get(bid))
+
+    # ── Step 6: Escalation trigger scan across security_alerts_30d ────────
+    escalation_triggers = []
+    sa_bucket = buckets.get("security_alerts_30d", {})
+    if sa_bucket.get("status") == "ok":
+        for row in (sa_bucket.get("sample") or []):
+            name = str(row.get("AlertName") or "").lower()
+            desc = str(row.get("Description") or "").lower()
+            for trigger in ["cobalt strike", "hands-on-keyboard", "amsi bypass",
+                            "ransomware", "dll hijack", "suspicious dll load"]:
+                if trigger in name or trigger in desc:
+                    escalation_triggers.append({
+                        "trigger": trigger,
+                        "alert":   row.get("AlertName"),
+                        "time":    row.get("TimeGenerated"),
+                    })
+
+    # ── Step 7: Execution-specific — expand sparse buckets ─────────────────
+    expanded_buckets = []
+    for bid in ["process_events", "file_events", "registry_events", "device_events"]:
+        if bid in buckets and buckets[bid].get("rows", 0) == 0:
+            # Expand to P1D
+            expand_task = next((t for t in tasks if t["bucket"] == bid), None)
+            if expand_task and expand_task.get("type") == "run_query":
+                exp_res = la_query(expand_task["kql"], "P1D")
+                buckets[f"{bid}_expanded"] = _summarise_bucket(f"{bid}_expanded", exp_res)
+                expanded_buckets.append(bid)
+
+    return _ok({
+        "incident_id":          incident_id,
+        "checklist_used":       cl,
+        "checklist_auto":       checklist == "auto",
+        # ── Core incident data ─────────────────────────────────────────────
+        "incident":             inc_data,
+        # ── Similar history ────────────────────────────────────────────────
+        "similar_history":      (hist_res.get("data") or {}) if hist_res.get("ok") else {"error": str(hist_res)},
+        # ── Entity summary for report writing ─────────────────────────────
+        "entities_extracted": {
+            "hosts":   hosts,
+            "users":   users,
+            "ips":     ips,
+            "primary_host": safe_host,
+            "primary_user": safe_user,
+            "primary_ip":   safe_ip,
+        },
+        # ── MITRE ─────────────────────────────────────────────────────────
+        "mitre": {
+            "tactics":    tactics,
+            "techniques": list((inc_data.get("mitre") or {}).get("techniques") or []),
+        },
+        # ── All telemetry buckets ──────────────────────────────────────────
+        "telemetry": buckets,
+        # ── Escalation triggers found ──────────────────────────────────────
+        "escalation_triggers":  escalation_triggers,
+        "escalation_fired":     bool(escalation_triggers),
+        # ── Buckets expanded due to sparse initial window ──────────────────
+        "expanded_buckets":     expanded_buckets,
+        # ── Checklist completeness audit ──────────────────────────────────
+        "checklist_coverage": {
+            t["bucket"]: buckets.get(t["bucket"], {}).get("status", "missing")
+            for t in tasks
+        },
+    })
+
+# ─────────────────────────────────────────────────────────────
+_register_tool_def(
     "get_similar_incident_history",
     (
         "Looks up prior Sentinel incidents over the last N days that share the same title as the "
