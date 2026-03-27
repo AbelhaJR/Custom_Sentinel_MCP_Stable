@@ -1572,9 +1572,13 @@ SecurityIncident
     # Don't fail hard — incident may have no correlated alerts yet
     alert_rows = _la_first_table_dicts(res_alerts["data"]) if res_alerts.get("ok") else []
 
-    # ── Query 3: Entities — parsed, expanded, and typed ────────────────────
-    # mv-expand + parse_json in KQL is the only reliable way to extract all
-    # entity types; reading the raw Entities blob misses most values.
+    # ── Query 3: Entities — parsed, expanded, typed by actual Sentinel schema ─
+    # Sentinel entity objects use $id/$ref back-references. $ref entries have
+    # no "Type" field — they are filtered out by isnotempty(EntityType).
+    # Field names are type-specific: HostName (host), AccountName (account),
+    # Address (ip), CommandLine (process), Name (file/url/dns).
+    # IPs are also nested inside host objects as LastIpAddress.Address and
+    # LastExternalIpAddress.Address — we extract those as separate ip rows.
     kql_entities = f"""
 SecurityIncident
 | where IncidentNumber == toint("{safe_id}") or tostring(IncidentName) =~ "{safe_id}"
@@ -1587,26 +1591,39 @@ SecurityIncident
 ) on $left.AlertId == $right.SystemAlertId
 | mv-expand Entity = parse_json(Entities)
 | where isnotempty(Entity)
-| extend EntityType = tostring(Entity.Type)
-| extend EntityName = coalesce(
-    tostring(Entity.HostName),
-    tostring(Entity.Name),
-    tostring(Entity.Address),
-    tostring(Entity.AccountName),
-    tostring(Entity.CommandLine),
-    tostring(Entity.Url),
-    tostring(Entity.DomainName)
+| extend EntityType = tolower(tostring(Entity.Type))
+| where isnotempty(EntityType)                              // drops $ref back-reference entries
+// ── Primary name per type ────────────────────────────────────────────────
+| extend EntityName = case(
+    EntityType == "host",     tostring(Entity.HostName),
+    EntityType == "account",  coalesce(tostring(Entity.AccountName), tostring(Entity.UserPrincipalName)),
+    EntityType == "ip",       tostring(Entity.Address),
+    EntityType == "process",  tostring(Entity.CommandLine),
+    EntityType == "file",     tostring(Entity.Name),
+    EntityType == "url",      tostring(Entity.Url),
+    EntityType == "dns",      tostring(Entity.DomainName),
+    EntityType == "registrykey", tostring(Entity.Key),
+    EntityType == "cloudapplication", tostring(Entity.Name),
+    tostring(Entity.Name)
 )
 | where isnotempty(EntityName) and EntityName != "null"
+// ── Also unpack IPs nested inside host objects ───────────────────────────
+| extend InternalIp  = iff(EntityType == "host", tostring(Entity.LastIpAddress.Address), "")
+| extend ExternalIp  = iff(EntityType == "host", tostring(Entity.LastExternalIpAddress.Address), "")
+| extend Fqdn        = iff(EntityType == "host", tostring(Entity.FQDN), "")
 | summarize
-    Hosts          = make_set_if(EntityName, EntityType =~ "host", 50),
-    Accounts       = make_set_if(EntityName, EntityType =~ "account", 50),
-    IpAddresses    = make_set_if(EntityName, EntityType =~ "ip", 50),
-    Urls           = make_set_if(EntityName, EntityType =~ "url", 50),
-    Files          = make_set_if(EntityName, EntityType =~ "file", 50),
-    Processes      = make_set_if(EntityName, EntityType =~ "process", 50),
-    RegistryKeys   = make_set_if(EntityName, EntityType =~ "registrykey", 50),
-    CloudResources = make_set_if(EntityName, EntityType =~ "cloudapplication" or EntityType =~ "azureresource", 50),
+    Hosts          = make_set_if(EntityName, EntityType == "host", 50),
+    Fqdns          = make_set_if(Fqdn, EntityType == "host" and isnotempty(Fqdn) and Fqdn != "null", 50),
+    Accounts       = make_set_if(EntityName, EntityType == "account", 50),
+    IpAddresses    = make_set_if(EntityName, EntityType == "ip", 50),
+    InternalIps    = make_set_if(InternalIp, isnotempty(InternalIp) and InternalIp != "null", 50),
+    ExternalIps    = make_set_if(ExternalIp, isnotempty(ExternalIp) and ExternalIp != "null", 50),
+    Urls           = make_set_if(EntityName, EntityType == "url", 50),
+    Files          = make_set_if(EntityName, EntityType == "file", 50),
+    Processes      = make_set_if(EntityName, EntityType == "process", 50),
+    Domains        = make_set_if(EntityName, EntityType == "dns", 50),
+    RegistryKeys   = make_set_if(EntityName, EntityType == "registrykey", 50),
+    CloudResources = make_set_if(EntityName, EntityType in ("cloudapplication", "azureresource"), 50),
     AllEntities    = make_set(EntityName, 200)
 by IncidentNumber
 """.strip()
@@ -1652,7 +1669,14 @@ by IncidentNumber
     else:
         risk = "Low"
 
-    return _ok({
+        # Merge internal + external IPs from host objects into the ip_addresses bucket
+        all_ips = list({
+            *entity_row.get("IpAddresses", []),
+            *entity_row.get("InternalIps", []),
+            *entity_row.get("ExternalIps", []),
+        })
+
+        return _ok({
         "mode": "report",
         # ── Incident core ──────────────────────────────────────────────────
         "incident_number":        incident.get("IncidentNumber"),
@@ -1674,11 +1698,13 @@ by IncidentNumber
         # ── Entities — typed buckets ───────────────────────────────────────
         "entities": {
             "hosts":           entity_row.get("Hosts", []),
+            "fqdns":           entity_row.get("Fqdns", []),
             "accounts":        entity_row.get("Accounts", []),
-            "ip_addresses":    entity_row.get("IpAddresses", []),
+            "ip_addresses":    all_ips,
             "urls":            entity_row.get("Urls", []),
             "files":           entity_row.get("Files", []),
             "processes":       entity_row.get("Processes", []),
+            "domains":         entity_row.get("Domains", []),
             "registry_keys":   entity_row.get("RegistryKeys", []),
             "cloud_resources": entity_row.get("CloudResources", []),
             "all":             entity_row.get("AllEntities", []),
@@ -1785,6 +1811,11 @@ SecurityAlert
     ips: set = set()
     hosts: set = set()
     domains: set = set()
+    processes: set = set()
+    files: set = set()
+
+    # id_map resolves $ref back-references: {"$ref": "3"} → object with $id "3"
+    id_map: Dict[str, dict] = {}
 
     for alert in alerts:
         entities = alert.get("Entities")
@@ -1797,18 +1828,65 @@ SecurityAlert
         if not isinstance(ent_list, list):
             continue
 
+        # First pass — build $id → object map so $ref entries can be resolved
+        for e in ent_list:
+            if isinstance(e, dict) and "$id" in e:
+                id_map[str(e["$id"])] = e
+
+        # Second pass — extract entity values
         for e in ent_list:
             if not isinstance(e, dict):
                 continue
+
+            # Skip pure $ref back-references (no Type field)
+            if "$ref" in e and "Type" not in e:
+                continue
+
             etype = (e.get("Type") or "").lower()
-            if etype == "account" and e.get("Name"):
-                users.add(e["Name"])
-            elif etype == "ip" and e.get("Address"):
-                ips.add(e["Address"])
-            elif etype in ["host", "machine"] and e.get("HostName"):
-                hosts.add(e["HostName"])
-            elif etype == "dns" and e.get("DomainName"):
-                domains.add(e["DomainName"])
+
+            if etype in ("host", "machine"):
+                name = e.get("HostName") or e.get("FQDN") or ""
+                if name:
+                    hosts.add(name.lower())
+                # Extract nested IPs from host objects
+                lip = (e.get("LastIpAddress") or {})
+                if isinstance(lip, dict) and lip.get("Address"):
+                    ips.add(lip["Address"])
+                eip = (e.get("LastExternalIpAddress") or {})
+                if isinstance(eip, dict) and eip.get("Address"):
+                    ips.add(eip["Address"])
+
+            elif etype == "account":
+                # AccountName is the canonical field; Name is usually the same
+                # UserPrincipalName appears for cloud/Entra accounts
+                name = (
+                    e.get("AccountName")
+                    or e.get("UserPrincipalName")
+                    or e.get("Name")
+                    or ""
+                )
+                if name and name.lower() not in ("system", ""):
+                    users.add(name.lower())
+
+            elif etype == "ip":
+                addr = e.get("Address") or ""
+                if addr:
+                    ips.add(addr)
+
+            elif etype == "dns":
+                d = e.get("DomainName") or ""
+                if d:
+                    domains.add(d.lower())
+
+            elif etype == "process":
+                cmd = e.get("CommandLine") or ""
+                if cmd:
+                    processes.add(cmd[:200])   # cap long command lines
+
+            elif etype == "file":
+                fname = e.get("Name") or ""
+                if fname:
+                    files.add(fname)
 
     alert_times = [a.get("AlertTime") for a in alerts if a.get("AlertTime")]
     first_alert = min(alert_times) if alert_times else None
@@ -1817,7 +1895,6 @@ SecurityAlert
     tactics = sorted({a.get("Tactics") for a in alerts if a.get("Tactics")})
     techniques = sorted({a.get("Techniques") for a in alerts if a.get("Techniques")})
 
-    # ── Parallel CMDB enrichment for extracted entities ────────────────────
     cmdb_pivots = list(ips)[:3] + list(hosts)[:3] + list(domains)[:3]
     cmdb_tasks = [
         (pivot, pivot, f'{CMDB_TABLE} | where tostring(*) contains "{escape_kql_string(str(pivot))}" | take 5')
@@ -1849,6 +1926,8 @@ SecurityAlert
         risk_score += 1
     if hosts:
         risk_score += 1
+    if processes:
+        risk_score += 1
 
     if risk_score >= 6:
         risk_level = "High"
@@ -1859,35 +1938,37 @@ SecurityAlert
 
     return _ok({
         "incident": {
-            "id": incident.get("IncidentNumber"),
-            "title": incident.get("Title"),
-            "severity": incident.get("Severity"),
-            "status": incident.get("Status"),
-            "owner": incident.get("Owner"),
-            "created_time": incident.get("CreatedTime"),
-            "last_modified_time": incident.get("LastModifiedTime"),
+            "id":                incident.get("IncidentNumber"),
+            "title":             incident.get("Title"),
+            "severity":          incident.get("Severity"),
+            "status":            incident.get("Status"),
+            "owner":             incident.get("Owner"),
+            "created_time":      incident.get("CreatedTime"),
+            "last_modified_time":incident.get("LastModifiedTime"),
         },
         "alerts": {
-            "count": len(alerts),
-            "names": sorted({a.get("AlertName") for a in alerts if a.get("AlertName")}),
+            "count":      len(alerts),
+            "names":      sorted({a.get("AlertName") for a in alerts if a.get("AlertName")}),
             "components": sorted({a.get("Component") for a in alerts if a.get("Component")}),
         },
         "entities": {
-            "users": sorted(users),
-            "ips": sorted(ips),
-            "hosts": sorted(hosts),
-            "domains": sorted(domains),
+            "users":     sorted(users),
+            "ips":       sorted(ips),
+            "hosts":     sorted(hosts),
+            "domains":   sorted(domains),
+            "processes": sorted(processes),
+            "files":     sorted(files),
         },
         "timeline": {
             "first_alert": first_alert,
-            "last_alert": last_alert,
+            "last_alert":  last_alert,
         },
         "mitre": {
-            "tactics": tactics,
+            "tactics":    tactics,
             "techniques": techniques,
         },
         "asset_context": cmdb_context,
-        "risk_level": risk_level,
+        "risk_level":    risk_level,
     })
 
 # ─────────────────────────────────────────────────────────────
