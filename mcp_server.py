@@ -1669,14 +1669,14 @@ by IncidentNumber
     else:
         risk = "Low"
 
-        # Merge internal + external IPs from host objects into the ip_addresses bucket
-        all_ips = list({
-            *entity_row.get("IpAddresses", []),
-            *entity_row.get("InternalIps", []),
-            *entity_row.get("ExternalIps", []),
-        })
+    # Merge internal + external IPs from host objects into the ip_addresses bucket
+    all_ips = list({
+        *entity_row.get("IpAddresses", []),
+        *entity_row.get("InternalIps", []),
+        *entity_row.get("ExternalIps", []),
+    })
 
-        return _ok({
+    return _ok({
         "mode": "report",
         # ── Incident core ──────────────────────────────────────────────────
         "incident_number":        incident.get("IncidentNumber"),
